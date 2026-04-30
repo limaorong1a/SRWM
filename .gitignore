@@ -1,0 +1,19 @@
+.env
+__pycache__/
+*.py[cod]
+
+# Runtime artifacts
+event/
+eval_results/
+runs/*
+!runs/.gitkeep
+
+# Ablation runtime artifacts
+消融实验/event/
+
+# Local tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+venv/

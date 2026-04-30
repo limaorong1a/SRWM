@@ -1,0 +1,11 @@
+# ALFWorld 环境
+alfworld
+
+# AgentOps / LLM
+langsmith
+openai
+
+# 其他依赖
+python-dotenv
+pyyaml
+textworld
