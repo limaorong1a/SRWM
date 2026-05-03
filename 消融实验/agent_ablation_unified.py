@@ -84,7 +84,7 @@ from paradigm_experiments.runtime.alfworld_env import (
     create_single_game_env,
 )
 from paradigm_experiments.runtime.settings import TASK_PREFIXES, ablation_flag
-from paradigm_experiments.observability.langsmith import EpisodeRunTree
+from paradigm_experiments.observability.langsmith import EpisodeRunTree, StepRunTree
 from paradigm_experiments.observability.event_log import TaskFileLogger, safe_filename_fragment
 from paradigm_experiments.observability.local_trace import LocalEpisodeTraceWriter
 from paradigm_experiments.observability.recorder import JsonlTraceRecorder, TraceRecorder
@@ -166,252 +166,329 @@ def run_episode(
     )
 
     for i in range(1, max_steps + 1):
-        admissible = get_admissible(info)
-        think_need_world_model = False
-        world_model_read = False
-        world_model_update: Optional[Dict[str, Any]] = None
-        if event_log:
-            event_log.banner(f"步 {i}/{max_steps}")
-            event_log.line(f"当前可执行动作数量: {len(admissible)}")
-        admissible_preview = ", ".join(admissible[:]) if admissible else "(空)"
-        last_think = ""
-        for rec in reversed(trajectory):
-            if rec.kind == "think" and rec.text and not rec.text.startswith("[parse_error]"):
-                last_think = rec.text
-                break
-        false_completion_claims = count_false_completion_claims(trajectory, recent_n=10)
-        think_text = ""
-        if not ABLA_WORLD:
-            think_prompt = (
-                init_prompt
-                + prompt
-                + "\nOutput exactly one line starting with 'think:'. "
-                + "Include your plan for the next steps. This thought will guide the next 'action'. "
-                + "Do NOT output any action/command text in this line."
-                + "\n【约束】若你在 think 里提到具体命令，该命令必须来自当前可执行动作列表；若不在列表中，请改为高层计划，不要杜撰命令。"
-                + "\n【避免重复】不要与上一步 think 语义完全相同；若上一思路失败，请明确说明你这一步改动点。"
-                + f"\n上一条有效 think: {last_think or '(无)'}"
-                + f"\n目标任务(goal): {goal or '(未解析)'}"
-                + f"\n当前可执行动作: {admissible_preview}"
-                + "\n请仅输出一行 JSON，格式为 {\"think\":\"...\"}。"
-                + "不要输出代码块、不要额外解释。"
-            )
-            if false_completion_claims >= 2:
-                think_prompt += (
-                    "\n【反循环强约束】你在最近若干步中已多次判断“任务已完成”，但环境实际尚未成功(won=False)。"
-                    "请立刻回读上面的目标任务(goal)，逐项核对前置条件与最终放置条件，明确指出“还缺哪一步/哪个状态”，"
-                    "并给出下一条用于补齐缺口的行动计划；禁止再次笼统声称已完成。"
-                )
-                if event_log:
-                    event_log.line(
-                        f"[anti_loop] 检测到最近误判“已完成”次数={false_completion_claims}，已注入回读目标强约束。"
-                    )
-            if failure_context:
-                think_prompt = failure_context + "\n" + think_prompt
-            last_think_output = ""
-            for retry in range(2):
-                think_output = llm2(
-                    think_prompt,
-                    client=client,
-                    model=model,
-                    max_tokens=max_tokens,
-                    **trace_extra,
-                ).strip()
-                last_think_output = think_output
-                think_text = parse_think_text(think_output)
-                if think_text:
+        parent_run_tree = (
+            episode_trace.run_tree if episode_trace and episode_trace.run_tree else None
+        )
+        with StepRunTree(
+            name=f"idea3.episode.step_{i:02d}",
+            parent=parent_run_tree,
+            inputs={"step": i},
+            metadata={"step": i},
+        ) as step_trace:
+            step_extra = step_trace.child_extra() or trace_extra
+            admissible = get_admissible(info)
+            think_need_world_model = False
+            world_model_read = False
+            world_model_update: Optional[Dict[str, Any]] = None
+            if event_log:
+                event_log.banner(f"步 {i}/{max_steps}")
+                event_log.line(f"当前可执行动作数量: {len(admissible)}")
+            admissible_preview = ", ".join(admissible[:]) if admissible else "(空)"
+            last_think = ""
+            for rec in reversed(trajectory):
+                if rec.kind == "think" and rec.text and not rec.text.startswith("[parse_error]"):
+                    last_think = rec.text
                     break
-                emit_model_raw(_emit, f"[think][try {retry + 1}/2 解析失败]", think_output)
-                if retry == 0:
-                    think_prompt += (
-                        "\n上一次输出无法解析为合法 think。"
-                        "请二选一输出（整段只能有一种，不要混写）：\n"
-                        "1) 一行以 think: 开头，例如：think: 我下一步先去 shelf 1 找花瓶。\n"
-                        "2) 一行 JSON：{\"think\":\"我下一步先去 shelf 1 找花瓶。\"}\n"
-                        "不要输出代码块、不要输出动作命令、不要多行。"
-                    )
-            if not think_text:
-                emit_model_raw(_emit, "[think][最终失败] 最后一次模型原始输出", last_think_output)
-                think_text = "[parse_error] think 输出解析失败"
-        else:
-            think_prompt = (
-                init_prompt
-                + prompt
-                + "\nOutput one-line JSON with keys think and need_world_model."
-                + "Example: {\"think\":\"...\",\"need_world_model\":false}."
-                + "Include your plan for the next steps. This thought will guide the next action."
-                + "Do NOT output any action/command text in think."
-                + "Set need_world_model=true only when you feel confused/uncertain and need memory of visited places/items."
-                + "\n【约束】若你在 think 里提到具体命令，该命令必须来自当前可执行动作列表；若不在列表中，请改为高层计划，不要杜撰命令。"
-                + "\n【避免重复】不要与上一步 think 语义完全相同；若上一思路失败，请明确说明你这一步改动点。"
-                + f"\n上一条有效 think: {last_think or '(无)'}"
-                + f"\n目标任务(goal): {goal or '(未解析)'}"
-                + f"\n当前可执行动作: {admissible_preview}"
-                + "\n请仅输出一行 JSON，格式为 {\"think\":\"...\",\"need_world_model\":false}。"
-                + "不要输出代码块、不要额外解释。"
-            )
-            if false_completion_claims >= 2:
-                think_prompt += (
-                    "\n【反循环强约束】你在最近若干步中已多次判断“任务已完成”，但环境实际尚未成功(won=False)。"
-                    "请立刻回读上面的目标任务(goal)，逐项核对前置条件与最终放置条件，明确指出“还缺哪一步/哪个状态”，"
-                    "并给出下一条用于补齐缺口的行动计划；禁止再次笼统声称已完成。"
-                )
-                if event_log:
-                    event_log.line(
-                        f"[anti_loop] 检测到最近误判“已完成”次数={false_completion_claims}，已注入回读目标强约束。"
-                    )
-            if failure_context:
-                think_prompt = failure_context + "\n" + think_prompt
-            last_think_output = ""
-            for retry in range(2):
-                think_output = llm2(
-                    think_prompt,
-                    client=client,
-                    model=model,
-                    max_tokens=max_tokens,
-                    **trace_extra,
-                ).strip()
-                last_think_output = think_output
-                dec = parse_think_decision(think_output)
-                think_text = dec.think
-                think_need_world_model = dec.need_world_model
-                if think_text:
-                    break
-                emit_model_raw(_emit, f"[think][try {retry + 1}/2 解析失败]", think_output)
-                if retry == 0:
-                    think_prompt += (
-                        "\n上一次输出无法解析为合法 think。"
-                        "请二选一输出（整段只能有一种，不要混写）：\n"
-                        "1) 一行以 think: 开头，例如：think: 我下一步先去 shelf 1 找花瓶。\n"
-                        "2) 一行 JSON：{\"think\":\"我下一步先去 shelf 1 找花瓶。\",\"need_world_model\":false}\n"
-                        "不要输出代码块、不要输出动作命令、不要多行。"
-                    )
-            if not think_text:
-                emit_model_raw(_emit, "[think][最终失败] 最后一次模型原始输出", last_think_output)
-                think_text = "[parse_error] think 输出解析失败"
-            elif think_need_world_model and task_world_model is not None:
-                wm_json = traced_world_model_read(task_world_model, **trace_extra)
-                world_model_read = True
-                if event_log:
-                    event_log.line("[world_model] 当前步触发读取（need_world_model=true），注入 JSON 记忆。")
-                    for ln in wm_json.splitlines():
-                        event_log.line(f"  {ln}")
-                replan_prompt = (
-                    (failure_context + "\n" if failure_context else "")
-                    + init_prompt
+            false_completion_claims = count_false_completion_claims(trajectory, recent_n=10)
+            think_text = ""
+            if not ABLA_WORLD:
+                think_prompt = (
+                    init_prompt
                     + prompt
-                    + "\n你刚才表示需要读取记忆。下面是任务级世界模型(JSON，仅含去过地点与地点所见物体)：\n"
-                    + wm_json
-                    + "\n请基于该记忆重新给出当前一步思考。"
-                    + "\n仅输出一行 JSON：{\"think\":\"...\",\"need_world_model\":false}。"
-                    + "不要输出动作命令，不要解释。"
+                    + "\nOutput exactly one line starting with 'think:'. "
+                    + "Include your plan for the next steps. This thought will guide the next 'action'. "
+                    + "Do NOT output any action/command text in this line."
+                    + "\n【约束】若你在 think 里提到具体命令，该命令必须来自当前可执行动作列表；若不在列表中，请改为高层计划，不要杜撰命令。"
+                    + "\n【避免重复】不要与上一步 think 语义完全相同；若上一思路失败，请明确说明你这一步改动点。"
+                    + f"\n上一条有效 think: {last_think or '(无)'}"
+                    + f"\n目标任务(goal): {goal or '(未解析)'}"
+                    + f"\n当前可执行动作: {admissible_preview}"
+                    + "\n请仅输出一行 JSON，格式为 {\"think\":\"...\"}。"
+                    + "不要输出代码块、不要额外解释。"
                 )
-                replan_raw = llm2(
-                    replan_prompt,
+                if false_completion_claims >= 2:
+                    think_prompt += (
+                        "\n【反循环强约束】你在最近若干步中已多次判断“任务已完成”，但环境实际尚未成功(won=False)。"
+                        "请立刻回读上面的目标任务(goal)，逐项核对前置条件与最终放置条件，明确指出“还缺哪一步/哪个状态”，"
+                        "并给出下一条用于补齐缺口的行动计划；禁止再次笼统声称已完成。"
+                    )
+                    if event_log:
+                        event_log.line(
+                            f"[anti_loop] 检测到最近误判“已完成”次数={false_completion_claims}，已注入回读目标强约束。"
+                        )
+                if failure_context:
+                    think_prompt = failure_context + "\n" + think_prompt
+                last_think_output = ""
+                for retry in range(2):
+                    think_output = llm2(
+                        think_prompt,
+                        client=client,
+                        model=model,
+                        max_tokens=max_tokens,
+                        **step_extra,
+                    ).strip()
+                    last_think_output = think_output
+                    think_text = parse_think_text(think_output)
+                    if think_text:
+                        break
+                    emit_model_raw(_emit, f"[think][try {retry + 1}/2 解析失败]", think_output)
+                    if retry == 0:
+                        think_prompt += (
+                            "\n上一次输出无法解析为合法 think。"
+                            "请二选一输出（整段只能有一种，不要混写）：\n"
+                            "1) 一行以 think: 开头，例如：think: 我下一步先去 shelf 1 找花瓶。\n"
+                            "2) 一行 JSON：{\"think\":\"我下一步先去 shelf 1 找花瓶。\"}\n"
+                            "不要输出代码块、不要输出动作命令、不要多行。"
+                        )
+                if not think_text:
+                    emit_model_raw(_emit, "[think][最终失败] 最后一次模型原始输出", last_think_output)
+                    think_text = "[parse_error] think 输出解析失败"
+            else:
+                think_prompt = (
+                    init_prompt
+                    + prompt
+                    + "\nOutput one-line JSON with keys think and need_world_model."
+                    + "Example: {\"think\":\"...\",\"need_world_model\":false}."
+                    + "Include your plan for the next steps. This thought will guide the next action."
+                    + "Do NOT output any action/command text in think."
+                    + "Set need_world_model=true only when you feel confused/uncertain and need memory of visited places/items."
+                    + "\n【约束】若你在 think 里提到具体命令，该命令必须来自当前可执行动作列表；若不在列表中，请改为高层计划，不要杜撰命令。"
+                    + "\n【避免重复】不要与上一步 think 语义完全相同；若上一思路失败，请明确说明你这一步改动点。"
+                    + f"\n上一条有效 think: {last_think or '(无)'}"
+                    + f"\n目标任务(goal): {goal or '(未解析)'}"
+                    + f"\n当前可执行动作: {admissible_preview}"
+                    + "\n请仅输出一行 JSON，格式为 {\"think\":\"...\",\"need_world_model\":false}。"
+                    + "不要输出代码块、不要额外解释。"
+                )
+                if false_completion_claims >= 2:
+                    think_prompt += (
+                        "\n【反循环强约束】你在最近若干步中已多次判断“任务已完成”，但环境实际尚未成功(won=False)。"
+                        "请立刻回读上面的目标任务(goal)，逐项核对前置条件与最终放置条件，明确指出“还缺哪一步/哪个状态”，"
+                        "并给出下一条用于补齐缺口的行动计划；禁止再次笼统声称已完成。"
+                    )
+                    if event_log:
+                        event_log.line(
+                            f"[anti_loop] 检测到最近误判“已完成”次数={false_completion_claims}，已注入回读目标强约束。"
+                        )
+                if failure_context:
+                    think_prompt = failure_context + "\n" + think_prompt
+                last_think_output = ""
+                for retry in range(2):
+                    think_output = llm2(
+                        think_prompt,
+                        client=client,
+                        model=model,
+                        max_tokens=max_tokens,
+                        **step_extra,
+                    ).strip()
+                    last_think_output = think_output
+                    dec = parse_think_decision(think_output)
+                    think_text = dec.think
+                    think_need_world_model = dec.need_world_model
+                    if think_text:
+                        break
+                    emit_model_raw(_emit, f"[think][try {retry + 1}/2 解析失败]", think_output)
+                    if retry == 0:
+                        think_prompt += (
+                            "\n上一次输出无法解析为合法 think。"
+                            "请二选一输出（整段只能有一种，不要混写）：\n"
+                            "1) 一行以 think: 开头，例如：think: 我下一步先去 shelf 1 找花瓶。\n"
+                            "2) 一行 JSON：{\"think\":\"我下一步先去 shelf 1 找花瓶。\",\"need_world_model\":false}\n"
+                            "不要输出代码块、不要输出动作命令、不要多行。"
+                        )
+                if not think_text:
+                    emit_model_raw(_emit, "[think][最终失败] 最后一次模型原始输出", last_think_output)
+                    think_text = "[parse_error] think 输出解析失败"
+                elif think_need_world_model and task_world_model is not None:
+                    wm_json = traced_world_model_read(task_world_model, **step_extra)
+                    world_model_read = True
+                    if event_log:
+                        event_log.line("[world_model] 当前步触发读取（need_world_model=true），注入 JSON 记忆。")
+                        for ln in wm_json.splitlines():
+                            event_log.line(f"  {ln}")
+                    replan_prompt = (
+                        (failure_context + "\n" if failure_context else "")
+                        + init_prompt
+                        + prompt
+                        + "\n你刚才表示需要读取记忆。下面是任务级世界模型(JSON，仅含去过地点与地点所见物体)：\n"
+                        + wm_json
+                        + "\n请基于该记忆重新给出当前一步思考。"
+                        + "\n仅输出一行 JSON：{\"think\":\"...\",\"need_world_model\":false}。"
+                        + "不要输出动作命令，不要解释。"
+                    )
+                    replan_raw = llm2(
+                        replan_prompt,
+                        client=client,
+                        model=model,
+                        max_tokens=max_tokens,
+                        **step_extra,
+                    ).strip()
+                    replan_dec = parse_think_decision(replan_raw)
+                    if replan_dec.think:
+                        think_text = replan_dec.think
+                    else:
+                        emit_model_raw(_emit, "[think][world_model 重规划解析失败]", replan_raw)
+            trajectory.append(StepRecord(kind="think", text=think_text))
+            _emit(f"[think] {think_text}")
+            prompt += f" think: {think_text}\nOK.\n>"
+            decision_prompt = (
+                init_prompt
+                + prompt
+                + "\n【本段指令：动作阶段】请从本步的可执行动作中选择下一条要执行的命令。"
+            )
+            scores: List[float] = []
+            candidates: List[Dict[str, Any]] = []
+            action_candidates_json = "[]"
+            if admissible:
+                context = init_prompt + prompt
+                if ABLA_TOT:
+                    scores = score_actions_with_judge(
+                        admissible,
+                        goal,
+                        context,
+                        client=judge_client,
+                        model=judge_model,
+                        max_tokens=max_tokens,
+                        **step_extra,
+                    )
+                else:
+                    scores = [50.0] * len(admissible)
+                    if event_log:
+                        event_log.line(
+                            "[ablation] TOT(动作评判/打分) 已关闭：候选均分 50.0，主模型仍按 act_index 选动作。"
+                        )
+                candidates = build_action_candidates(admissible, scores)
+                action_candidates_json = json.dumps(candidates, ensure_ascii=False)
+                decision_prompt += (
+                    "\n可执行动作结构化数组（完整列表）:\n"
+                    + action_candidates_json
+                )
+            # 把“严格输出格式”放在末尾，避免被候选动作块稀释
+            decision_prompt += (
+                "\n\n【输出格式要求】请仅输出一行 JSON。优先格式：{\"act_index\":N}，"
+                "其中 N 必须是上方结构化数组中的 index。"
+                "兼容格式：{\"act\":\"...\"}，其值必须与数组中某个 cmd 逐字一致。"
+                "不要输出代码块，不要输出解释，不要输出数组外命令。"
+            )
+            if event_log and admissible:
+                event_log.line("[judge] 候选动作及分数:")
+                for j, a in enumerate(admissible[:]):
+                    sc = scores[j] if j < len(scores) else 0.0
+                    event_log.line(f"  {j+1}. {a}  |  {sc:.1f}")
+            if failure_context:
+                decision_prompt = failure_context + "\n" + decision_prompt
+            text = ""
+            output = ""
+            act_raw_attempts: List[Tuple[int, str]] = []
+            for retry in range(3):
+                prompt_try = decision_prompt
+                if retry == 1:
+                    prompt_try += (
+                        "\n\n【纠错-1】你上一次输出不合规（不是合法 JSON 或 act 不在候选动作中）。"
+                        "请严格按以下规则输出：\n"
+                        "- 只输出一行 JSON 对象，不要任何其它字符（不要前后空行、不要代码块、不要解释）。\n"
+                        "- 仅允许键 act_index 或 act。\n"
+                        "- 若用 act_index，必须是上方结构化数组中的 index（推荐）。\n"
+                        "- 若用 act，必须逐字匹配数组中某个 cmd（禁止改写）。\n"
+                        f"\n候选动作结构化数组：\n{action_candidates_json}\n"
+                    )
+                elif retry == 2:
+                    prompt_try += (
+                        "\n\n【纠错-2（强制索引协议）】你仍未输出合法动作。现在禁止输出 act 字符串，改用索引选择。"
+                        "请只输出一行 JSON：{\"act_index\":N}，其中 N 必须取自候选动作结构化数组中的 index。"
+                        "禁止输出任何其它键。"
+                        f"\n候选动作结构化数组：\n{action_candidates_json}\n"
+                    )
+                output = llm(
+                    prompt_try,
                     client=client,
                     model=model,
                     max_tokens=max_tokens,
-                    **trace_extra,
+                    **step_extra,
                 ).strip()
-                replan_dec = parse_think_decision(replan_raw)
-                if replan_dec.think:
-                    think_text = replan_dec.think
-                else:
-                    emit_model_raw(_emit, "[think][world_model 重规划解析失败]", replan_raw)
-        trajectory.append(StepRecord(kind="think", text=think_text))
-        _emit(f"[think] {think_text}")
-        prompt += f" think: {think_text}\nOK.\n>"
-        decision_prompt = (
-            init_prompt
-            + prompt
-            + "\n【本段指令：动作阶段】请从本步的可执行动作中选择下一条要执行的命令。"
-        )
-        scores: List[float] = []
-        candidates: List[Dict[str, Any]] = []
-        action_candidates_json = "[]"
-        if admissible:
-            context = init_prompt + prompt
-            if ABLA_TOT:
-                scores = score_actions_with_judge(
-                    admissible,
-                    goal,
-                    context,
-                    client=judge_client,
-                    model=judge_model,
-                    max_tokens=max_tokens,
-                    **trace_extra,
-                )
-            else:
-                scores = [50.0] * len(admissible)
-                if event_log:
-                    event_log.line(
-                        "[ablation] TOT(动作评判/打分) 已关闭：候选均分 50.0，主模型仍按 act_index 选动作。"
+                act_raw_attempts.append((retry, output))
+                text = parse_action_text(output, admissible)
+                if text:
+                    break
+                emit_model_raw(_emit, f"[act][try {retry + 1}/3 解析失败]", output)
+            if not text:
+                local_trace.record_step(
+                    StepTrace(
+                        step_index=i,
+                        phase="act",
+                        thought=think_text,
+                        action_raw=output,
+                        action_validated="",
+                        admissible_actions=admissible,
+                        observation_before=current_observation_for_trace,
+                        parser_status="action_parse_failed",
+                        candidates=candidates,
+                        scores=scores,
+                        metadata={
+                            "act_attempts": len(act_raw_attempts),
+                            "false_completion_claims": false_completion_claims,
+                            "world_model_read": world_model_read,
+                            "need_world_model": think_need_world_model,
+                        },
                     )
-            candidates = build_action_candidates(admissible, scores)
-            action_candidates_json = json.dumps(candidates, ensure_ascii=False)
-            decision_prompt += (
-                "\n可执行动作结构化数组（完整列表）:\n"
-                + action_candidates_json
+                )
+                _emit("[act] 多次解析失败，汇总各次模型原始输出如下：")
+                for ridx, out in act_raw_attempts:
+                    emit_model_raw(_emit, f"  └── [act][try {ridx + 1}/3]", out)
+                if event_log:
+                    event_log.banner("Episode 提前结束：act 输出无法解析")
+                    event_log.line("return score=0.0, won=False（原因：多次 act 解析失败/不合规）")
+                local_trace.finish(
+                    False,
+                    False,
+                    "action_parse_failed",
+                    false_completion_claims=count_false_completion_claims(trajectory, recent_n=20),
+                )
+                step_trace.end(
+                    outputs={
+                        "step": i,
+                        "status": "action_parse_failed",
+                        "thought": think_text,
+                        "act_attempts": len(act_raw_attempts),
+                        "false_completion_claims": false_completion_claims,
+                    }
+                )
+                return 0.0, False, trajectory
+            _emit(f"[act] kind=act  text={text}")
+            trajectory.append(StepRecord(kind="act", text=text))
+            observation, _env_reward, env_done, info = traced_env_step(env, text, **step_extra)
+            observation = process_ob(observation[0])
+            won = bool(info.get("won", [False])[0])
+            episode_over = bool(env_done[0])
+            _emit(f"[ob]  {observation}")
+            _emit(
+                f"[env] episode_over={episode_over}  won={won}  "
+                f"(说明: done/episode_over 仅表示回合结束，不等价于任务成功)"
             )
-        # 把“严格输出格式”放在末尾，避免被候选动作块稀释
-        decision_prompt += (
-            "\n\n【输出格式要求】请仅输出一行 JSON。优先格式：{\"act_index\":N}，"
-            "其中 N 必须是上方结构化数组中的 index。"
-            "兼容格式：{\"act\":\"...\"}，其值必须与数组中某个 cmd 逐字一致。"
-            "不要输出代码块，不要输出解释，不要输出数组外命令。"
-        )
-        if event_log and admissible:
-            event_log.line("[judge] 候选动作及分数（至多前 15 条）:")
-            for j, a in enumerate(admissible[:]):
-                sc = scores[j] if j < len(scores) else 0.0
-                event_log.line(f"  {j+1}. {a}  |  {sc:.1f}")
-        if failure_context:
-            decision_prompt = failure_context + "\n" + decision_prompt
-        text = ""
-        output = ""
-        act_raw_attempts: List[Tuple[int, str]] = []
-        for retry in range(3):
-            prompt_try = decision_prompt
-            if retry == 1:
-                prompt_try += (
-                    "\n\n【纠错-1】你上一次输出不合规（不是合法 JSON 或 act 不在候选动作中）。"
-                    "请严格按以下规则输出：\n"
-                    "- 只输出一行 JSON 对象，不要任何其它字符（不要前后空行、不要代码块、不要解释）。\n"
-                    "- 仅允许键 act_index 或 act。\n"
-                    "- 若用 act_index，必须是上方结构化数组中的 index（推荐）。\n"
-                    "- 若用 act，必须逐字匹配数组中某个 cmd（禁止改写）。\n"
-                    f"\n候选动作结构化数组：\n{action_candidates_json}\n"
+            if ABLA_WORLD and task_world_model is not None:
+                world_model_update = traced_world_model_update(
+                    model=task_world_model,
+                    action=text,
+                    observation=observation,
+                    current_place=current_place,
+                    **step_extra,
                 )
-            elif retry == 2:
-                prompt_try += (
-                    "\n\n【纠错-2（强制索引协议）】你仍未输出合法动作。现在禁止输出 act 字符串，改用索引选择。"
-                    "请只输出一行 JSON：{\"act_index\":N}，其中 N 必须取自候选动作结构化数组中的 index。"
-                    "禁止输出任何其它键。"
-                    f"\n候选动作结构化数组：\n{action_candidates_json}\n"
-                )
-            output = llm(
-                prompt_try,
-                client=client,
-                model=model,
-                max_tokens=max_tokens,
-                **trace_extra,
-            ).strip()
-            act_raw_attempts.append((retry, output))
-            text = parse_action_text(output, admissible)
-            if text:
-                break
-            emit_model_raw(_emit, f"[act][try {retry + 1}/3 解析失败]", output)
-        if not text:
+                current_place = str(world_model_update["current_place"])
+            trajectory.append(StepRecord(kind="ob", text=observation))
             local_trace.record_step(
                 StepTrace(
                     step_index=i,
-                    phase="act",
+                    phase="env_step",
                     thought=think_text,
                     action_raw=output,
-                    action_validated="",
+                    action_validated=text,
                     admissible_actions=admissible,
                     observation_before=current_observation_for_trace,
-                    parser_status="action_parse_failed",
+                    observation_after=observation,
+                    reward=float(_env_reward[0]) if isinstance(_env_reward, (list, tuple)) and _env_reward else None,
+                    done=episode_over,
+                    won=won,
+                    parser_status="ok",
                     candidates=candidates,
                     scores=scores,
                     metadata={
@@ -419,87 +496,50 @@ def run_episode(
                         "false_completion_claims": false_completion_claims,
                         "world_model_read": world_model_read,
                         "need_world_model": think_need_world_model,
+                        "world_model_update": world_model_update,
                     },
                 )
             )
-            _emit("[act] 多次解析失败，汇总各次模型原始输出如下：")
-            for ridx, out in act_raw_attempts:
-                emit_model_raw(_emit, f"  └── [act][try {ridx + 1}/3]", out)
-            if event_log:
-                event_log.banner("Episode 提前结束：act 输出无法解析")
-                event_log.line("return score=0.0, won=False（原因：多次 act 解析失败/不合规）")
-            local_trace.finish(
-                False,
-                False,
-                "action_parse_failed",
-                false_completion_claims=count_false_completion_claims(trajectory, recent_n=20),
-            )
-            return 0.0, False, trajectory
-        _emit(f"[act] kind=act  text={text}")
-        trajectory.append(StepRecord(kind="act", text=text))
-        observation, _env_reward, env_done, info = traced_env_step(env, text, **trace_extra)
-        observation = process_ob(observation[0])
-        won = bool(info.get("won", [False])[0])
-        episode_over = bool(env_done[0])
-        _emit(f"[ob]  {observation}")
-        _emit(
-            f"[env] episode_over={episode_over}  won={won}  "
-            f"(说明: done/episode_over 仅表示回合结束，不等价于任务成功)"
-        )
-        if ABLA_WORLD and task_world_model is not None:
-            world_model_update = traced_world_model_update(
-                model=task_world_model,
-                action=text,
-                observation=observation,
-                current_place=current_place,
-                **trace_extra,
-            )
-            current_place = str(world_model_update["current_place"])
-        trajectory.append(StepRecord(kind="ob", text=observation))
-        local_trace.record_step(
-            StepTrace(
-                step_index=i,
-                phase="env_step",
-                thought=think_text,
-                action_raw=output,
-                action_validated=text,
-                admissible_actions=admissible,
-                observation_before=current_observation_for_trace,
-                observation_after=observation,
-                reward=float(_env_reward[0]) if isinstance(_env_reward, (list, tuple)) and _env_reward else None,
-                done=episode_over,
-                won=won,
-                parser_status="ok",
-                candidates=candidates,
-                scores=scores,
-                metadata={
-                    "act_attempts": len(act_raw_attempts),
-                    "false_completion_claims": false_completion_claims,
+            current_observation_for_trace = observation
+            prompt += f" {text}\n{observation}\n>"
+            if episode_over:
+                score = 1.0 if won else 0.0
+                if event_log:
+                    if won:
+                        event_log.banner("Episode 结束：任务成功（won=True）")
+                    else:
+                        event_log.banner(
+                            "Episode 结束：回合已结束但未达成目标（won=False，多为超时或失败终止）"
+                        )
+                    event_log.line(f"return score={score}  won={won}")
+                local_trace.finish(
+                    bool(won),
+                    won,
+                    "success" if won else "env_done_without_win",
+                    false_completion_claims=count_false_completion_claims(trajectory, recent_n=20),
+                )
+                step_trace.end(
+                    outputs={
+                        "step": i,
+                        "action": text,
+                        "won": won,
+                        "episode_over": True,
+                        "score": score,
+                        "place": current_place,
+                    }
+                )
+                return score, won, trajectory
+            step_trace.end(
+                outputs={
+                    "step": i,
+                    "action": text,
+                    "won": won,
+                    "episode_over": False,
+                    "place": current_place,
                     "world_model_read": world_model_read,
                     "need_world_model": think_need_world_model,
-                    "world_model_update": world_model_update,
-                },
+                }
             )
-        )
-        current_observation_for_trace = observation
-        prompt += f" {text}\n{observation}\n>"
-        if episode_over:
-            score = 1.0 if won else 0.0
-            if event_log:
-                if won:
-                    event_log.banner("Episode 结束：任务成功（won=True）")
-                else:
-                    event_log.banner(
-                        "Episode 结束：回合已结束但未达成目标（won=False，多为超时或失败终止）"
-                    )
-                event_log.line(f"return score={score}  won={won}")
-            local_trace.finish(
-                bool(won),
-                won,
-                "success" if won else "env_done_without_win",
-                false_completion_claims=count_false_completion_claims(trajectory, recent_n=20),
-            )
-            return score, won, trajectory
     if event_log:
         event_log.banner("Episode 结束：未在步数内完成（失败）")
         event_log.line("return score=0.0, won=False")
@@ -757,7 +797,7 @@ def main():
             if isinstance(ti0, list) and len(ti0) > 0 and task_indices_1based:
                 if state.get("next_subset_i") is not None:
                     subset_start_0b = max(0, int(state.get("next_subset_i", 0) or 0))
-                if loaded_rs is None and state.get("rs") is not None:
+                if loaded_rs is None and state.get("rs") is not None: #subset continue
                     loaded_rs = [float(x) for x in state.get("rs", [0.0] * 6)]
                 if loaded_cnts is None and state.get("cnts") is not None:
                     loaded_cnts = [int(x) for x in state.get("cnts", [0] * 6)]

@@ -32,8 +32,6 @@ def resolve_path_under_script_or_parent(rel: str, script_dir: str, base_dir: str
         return script_path
     if not os.path.isabs(rel) and os.path.isdir(base_path):
         return base_path
-    if os.path.isdir(script_path):
-        return script_path
     raise FileNotFoundError(f"路径不存在，已尝试:\n  {script_path}\n  {base_path}")
 
 

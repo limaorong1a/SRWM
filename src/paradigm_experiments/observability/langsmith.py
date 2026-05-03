@@ -86,3 +86,84 @@ class EpisodeRunTree(AbstractContextManager["EpisodeRunTree"]):
         if exc is not None:
             self.end(error=str(exc))
         return False
+
+
+class StepRunTree(AbstractContextManager["StepRunTree"]):
+    """Manual child run for one decision step inside an episode.
+
+    Acts as an intermediate "chain" node so that all sub-runs produced during a
+    single ALFWorld step (think LLM, judge, act LLM, env.step, world model
+    update, ...) are grouped under one step node in the LangSmith UI, instead
+    of being flattened directly under the episode parent.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        parent: Any = None,
+        inputs: Optional[Dict[str, Any]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ):
+        self.name = name
+        self.parent = parent
+        self.inputs = inputs or {}
+        self.metadata = metadata or {}
+        self.run_tree: Any = None
+        self._ended = False
+
+    @property
+    def enabled(self) -> bool:
+        return (
+            langsmith_enabled()
+            and RunTree is not None
+            and self.parent is not None
+        )
+
+    def __enter__(self) -> "StepRunTree":
+        if not self.enabled:
+            return self
+        try:
+            create_child = getattr(self.parent, "create_child", None)
+            if callable(create_child):
+                self.run_tree = create_child(
+                    name=self.name,
+                    run_type="chain",
+                    inputs=self.inputs,
+                    extra={"metadata": self.metadata},
+                )
+            else:
+                self.run_tree = RunTree(
+                    name=self.name,
+                    run_type="chain",
+                    inputs=self.inputs,
+                    extra={"metadata": self.metadata},
+                    parent_run=self.parent,
+                )
+            self.run_tree.post()
+        except Exception:
+            self.run_tree = None
+        return self
+
+    def child_extra(self) -> Dict[str, Any]:
+        if not self.run_tree:
+            return {}
+        return {"langsmith_extra": {"parent": self.run_tree}}
+
+    def end(self, outputs: Optional[Dict[str, Any]] = None, error: Optional[str] = None) -> None:
+        if not self.run_tree or self._ended:
+            return
+        try:
+            if error:
+                self.run_tree.end(error=error)
+            else:
+                self.run_tree.end(outputs=outputs or {})
+            self.run_tree.post()
+        finally:
+            self._ended = True
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        if exc is not None:
+            self.end(error=str(exc))
+        elif not self._ended:
+            self.end()
+        return False
