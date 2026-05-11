@@ -17,3 +17,12 @@ runs/*
 .mypy_cache/
 .venv/
 venv/
+rl/.venv-rl/
+rl/checkpoints/
+rl/outputs/
+rl/wandb/
+rl/runs/
+rl/data/raw/
+rl/data/sft/
+rl/**/.env
+*.safetensors
