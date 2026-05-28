@@ -1,66 +1,163 @@
-# ALFWorld AgentOps Experiments
+# SRWM: Structured Reflection & World Modeling for ALFWorld Agents
 
-本项目聚焦当前 Idea3 / 结构化反思 / 世界模型 / 消融实验这条 Agent 架构。
+<p align="center">
+  <strong>Research Codebase for Reproducible Agentic Decision-Making Experiments</strong><br/>
+  <em>面向论文复现、消融研究与可观测性分析的一体化实验仓库</em>
+</p>
 
-旧 ReAct、CoT、ToT baseline 代码，以及早期分叉出来的结构化反思长脚本，不再作为维护目标。当前只保留一条主实现：
+---
 
-- `消融实验/agent_ablation_unified.py`：统一 Agent 架构实现，通过 `ABLA_TOT`、`ABLA_REFLECT`、`ABLA_WORLD` 控制三个 contribution。
-- `消融实验/run_ablation.py`：推荐 CLI 入口，用 `--variant` 和 `--three-shot` 设置消融组合。
+## 项目定位（Repository Scope）
 
-常用示例：
+本仓库对应论文的**核心实验实现**，聚焦于 ALFWorld 环境中的 Agent 架构设计与系统性消融分析。  
+当前对外展示与维护的主线包括：
 
-```powershell
-python .\消融实验\run_ablation.py --variant full -- --num-tasks 5
-python .\消融实验\run_ablation.py --variant w_o_tot -- --num-tasks 5
-python .\消融实验\run_ablation.py --variant full --three-shot -- --num-tasks 5
+- **结构化思维决策（ToT-style action selection）**
+- **失败反思机制（Structured Reflection）**
+- **显式世界模型（World Model read/update）**
+- **统一消融框架（Ablation Protocol）**
+- **本地/在线可观测性（Local Trace + LangSmith）**
+
+> 说明：按你的论文展示需求，仓库中的 `rl/` 目录不作为本 README 的介绍范围。
+
+---
+
+## 方法总览（Method Overview）
+
+我们将 Agent 执行过程拆解为可组合模块，并通过统一控制开关进行贡献验证：
+
+1. **Action Selection**：基于候选动作与上下文进行选择。
+2. **World Model**：维护环境事实状态，支持读取与更新。
+3. **Reflection**：失败后生成结构化反思，指导下一次尝试。
+4. **Observability**：记录细粒度运行事件，支持离线与在线诊断。
+5. **Evaluation**：从 trajectory 自动聚合成功率与失败原因等指标。
+
+这一设计使得“算法贡献 → 运行行为 → 评价指标”形成闭环，便于论文中的定量与定性分析。
+
+---
+
+## 代码结构（excluding `rl/`）
+
+```text
+.
+├─ src/paradigm_experiments/
+│  ├─ agents/                 # action_selection / reflection / world_model / parsing
+│  ├─ runtime/                # ALFWorld env 接入、LLM 调用、运行配置
+│  ├─ observability/          # local trace、event log、LangSmith 追踪
+│  └─ evaluation/             # trajectory 状态汇总与离线报告
+├─ 消融实验/
+│  ├─ agent_ablation_unified.py   # 统一 Agent 实现与消融开关
+│  └─ run_ablation.py             # 推荐 CLI 入口
+├─ prompts/                   # prompt 配置
+├─ tests/unit/                # 单元测试
+├─ runs/                      # 实验输出目录（日志、轨迹、报告）
+├─ base_config.yaml           # 基础运行配置
+└─ README.md
 ```
 
-## Runtime Artifacts
+---
 
-实验产物不再和源码混放。历史产物会归档到 `runs/archive/`，新的运行产物应逐步迁移到 `runs/` 下。当前兼容脚本如果仍输出到旧目录，`.gitignore` 会忽略这些目录：
+## 快速开始（Quick Start）
 
-- `event/`
-- `eval_results/`
-- `消融实验/event/`
+### 1) 环境安装
 
-当前运行目录内会同时保存两类观测产物：
+建议使用 Python 3.10+：
 
-- `task_*.log`：面向人工阅读的逐步日志。
-- `traces/task_<idx>_attempt_<n>.jsonl`：面向离线分析的结构化 trajectory，包含 `episode_start`、逐步 `step` 和 `episode_end` 事件。
+```bash
+pip install -e .[dev]
+```
 
-可基于本地 JSONL trace 生成离线报告：
+或最小安装：
 
-```powershell
+```bash
+pip install -r requirements.txt
+pip install -e .
+```
+
+### 2) 运行消融实验
+
+统一入口：`消融实验/run_ablation.py`
+
+```bash
+python 消融实验/run_ablation.py --variant full -- --num-tasks 5
+python 消融实验/run_ablation.py --variant w_o_tot -- --num-tasks 5
+python 消融实验/run_ablation.py --variant full --three-shot -- --num-tasks 5
+```
+
+### 3) 生成离线报告
+
+```bash
 python -m paradigm_experiments.evaluation.report --run-dir <run-dir>
 ```
 
-报告会聚合 success rate、termination reason、action parse failure、world model read/update 次数等指标。
+---
 
-## AgentOps Direction
+## 消融协议（Ablation Protocol）
 
-当前已完成：
+核心实现位于 `消融实验/agent_ablation_unified.py`，通过以下开关控制贡献项：
 
-1. 旧 baseline 与重复长脚本已移除，统一入口收敛到 `agent_ablation_unified.py` / `run_ablation.py`。
-2. `world_model`、`reflection`、`action_selection`、`evaluation.state`、`runtime`、`observability` 已拆成包内模块。
-3. 已接入 LangSmith episode-level `RunTree` 和关键步骤 `@traceable`。
-4. 已接入本地 JSONL trajectory 和离线报告。
+- `ABLA_TOT`：是否启用 ToT-style 决策过程
+- `ABLA_REFLECT`：是否启用失败反思
+- `ABLA_WORLD`：是否启用世界模型
 
-后续若继续增强，可把 `run_episode` 主循环进一步拆成专门的 runner class，并根据真实 LangSmith 页面效果决定是否把关键步骤从 `@traceable` 改为手动 `RunTree`。
+推荐通过 `--variant` 参数管理组合，确保实验设置可复现、可对比、可追踪。
 
-## LangSmith
+---
 
-LangSmith tracing 默认关闭，不会影响离线实验。需要观测链路时设置：
+## 可观测性与可复现性（Observability & Reproducibility）
 
-```powershell
-$env:LANGSMITH_TRACING = "true"
-$env:LANGSMITH_API_KEY = "<your-api-key>"
-$env:LANGSMITH_PROJECT = "alfworld-agentops"
+### 本地观测产物
+
+每次运行会产生两类关键文件：
+
+- `task_*.log`：面向人工阅读的执行日志
+- `traces/task_<idx>_attempt_<n>.jsonl`：结构化 trajectory（`episode_start` / `step` / `episode_end`）
+
+这使得论文中的失败案例分析、动作级误差定位、反思效果验证可以直接基于原始轨迹复盘。
+
+### LangSmith（可选）
+
+默认关闭，不影响离线实验。需要在线追踪时可设置：
+
+```bash
+export LANGSMITH_TRACING=true
+export LANGSMITH_API_KEY=<your-api-key>
+export LANGSMITH_PROJECT=alfworld-agentops
 ```
 
-当前实现中，每个 ALFWorld task attempt 会创建一个手动 episode `RunTree`。它的作用是把一次任务尝试作为 LangSmith 中的父级 run，方便在同一个树下观察 think LLM、act LLM、judge 打分、world model read/update、`env.step` 和失败反思。这样看 trace 时不会只看到一堆散落的 LLM 调用，而是能按“第几个任务、第几次尝试”定位完整链路。
+系统会以 **task attempt** 为粒度组织父子运行树，便于从实验编号直接定位完整决策链路。
 
-本项目采用 `src/` layout。开发时建议安装为 editable 包：
+---
 
-```powershell
-pip install -e .[dev]
+## 评估指标（Evaluation Signals）
+
+离线报告可聚合（包括但不限于）：
+
+- Success Rate
+- Termination Reason 分布
+- Action Parse Failure 统计
+- World Model 读取/更新频次
+
+可进一步扩展为论文附录所需的 episode-level 表格、失败类别热图与错误案例切片分析。
+
+---
+
+## 单元测试（Unit Tests）
+
+```bash
+pytest tests/unit -q
 ```
+
+测试覆盖解析、动作选择、世界模型、反思逻辑、运行配置、观测记录与报告生成等关键模块。
+
+---
+
+## 引用与致谢（Citation）
+
+如果本仓库对你的研究有帮助，欢迎在论文中引用对应工作，并注明本仓库链接与版本号（commit hash），以确保可复现性。
+
+---
+
+## License
+
+如未单独声明，请根据仓库后续提供的许可证文件使用本项目代码。
